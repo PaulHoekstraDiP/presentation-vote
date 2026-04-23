@@ -230,6 +230,68 @@
             min-height: 20px;
             text-align: center;
         }
+
+        /* === "WHICH MICHAEL?" MODAL === */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            padding: 24px;
+            animation: fadeIn 0.2s ease;
+        }
+
+        .modal-overlay.open { display: flex; }
+
+        .modal-card {
+            background: var(--dip-deep-green);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 20px;
+            padding: 28px 24px;
+            max-width: 360px;
+            width: 100%;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .modal-card h3 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .modal-btns {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .modal-btn {
+            padding: 16px 20px;
+            border-radius: 14px;
+            border: none;
+            font-family: var(--font);
+            font-size: 18px;
+            font-weight: 700;
+            color: #fff;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            transition: transform 0.15s ease, opacity 0.15s ease;
+        }
+
+        .modal-btn:active { transform: scale(0.97); opacity: 0.9; }
+
+        .modal-btn.cannon { background: var(--dip-orange); }
+        .modal-btn.pistol {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            color: var(--dip-lime);
+        }
     </style>
 </head>
 <body>
@@ -279,6 +341,17 @@
         </div>
     </div>
 
+    <!-- Easter egg: "Which Michael?" picker -->
+    <div class="modal-overlay" id="michaelModal" role="dialog" aria-modal="true" aria-labelledby="michaelModalTitle">
+        <div class="modal-card">
+            <h3 id="michaelModalTitle">Which Michael?</h3>
+            <div class="modal-btns">
+                <button type="button" class="modal-btn cannon" data-alias="Data Cannon">Data Cannon</button>
+                <button type="button" class="modal-btn pistol" data-alias="Data Pistol">Data Pistol</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         /* ===========================================
            VOTING LOGIC
@@ -294,16 +367,43 @@
             'Prefer': 'return=minimal'
         };
 
+        // Name aliases: silent rewrite for known attendees, picker for ambiguous ones.
+        // Michael matches as a whole word anywhere in the name ("Michael Smith",
+        // "Smith Michael", etc.) — but not substrings like "Carmichael".
+        function resolveAlias(rawName) {
+            const key = rawName.trim().toLowerCase();
+            if (/\bmichael\b/.test(key)) return askWhichMichael();
+            if (key === 'stefan')        return Promise.resolve('Mr. Databricks');
+            return Promise.resolve(rawName.trim());
+        }
+
+        function askWhichMichael() {
+            return new Promise(resolve => {
+                const modal = document.getElementById('michaelModal');
+                modal.classList.add('open');
+                const onClick = (e) => {
+                    const alias = e.target && e.target.dataset && e.target.dataset.alias;
+                    if (!alias) return;
+                    modal.classList.remove('open');
+                    modal.removeEventListener('click', onClick);
+                    resolve(alias);
+                };
+                modal.addEventListener('click', onClick);
+            });
+        }
+
         function submitGuess() {
             const nameEl = document.getElementById('name');
             const linesEl = document.getElementById('lines');
             const errorEl = document.getElementById('error');
             const btn = document.getElementById('submitBtn');
 
-            const name = (nameEl.value || '').trim();
+            if (btn.disabled) return;
+
+            const rawName = (nameEl.value || '').trim();
             const lines = parseInt(linesEl.value);
 
-            if (!name) {
+            if (!rawName) {
                 errorEl.textContent = 'Enter your name';
                 return;
             }
@@ -316,16 +416,16 @@
             btn.disabled = true;
             btn.textContent = 'Submitting...';
 
-            fetch(`${SUPABASE_URL}/rest/v1/votes`, {
-                method: 'POST',
-                headers: HEADERS,
-                body: JSON.stringify({ name, lines })
-            })
-            .then(r => {
-                if (!r.ok) throw new Error('Network error');
-                showThankYou(name, lines);
-            })
-            .catch(() => {
+            resolveAlias(rawName).then(name => {
+                return fetch(`${SUPABASE_URL}/rest/v1/votes`, {
+                    method: 'POST',
+                    headers: HEADERS,
+                    body: JSON.stringify({ name, lines })
+                }).then(r => {
+                    if (!r.ok) throw new Error('Network error');
+                    showThankYou(name, lines);
+                });
+            }).catch(() => {
                 errorEl.textContent = 'Failed to submit — try again';
                 btn.disabled = false;
                 btn.textContent = 'Submit my guess';
