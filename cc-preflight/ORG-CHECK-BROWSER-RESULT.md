@@ -17,30 +17,64 @@ check 1, stop"), no further checks were attempted.
 
 | # | Check | Status | Observed (one line) | If ❌: setting most likely responsible |
 |---|-------|--------|----------------------|----------------------------------------|
-| 1 | Session basics | ❌ | Model = `claude-opus-5`; tools present (Bash, Read, Write, Edit, Glob, Grep, Agent, Skill, Workflow, GitHub MCP, Claude Code Remote MCP); `python3 --version`, `uv --version`, `df -h .` all failed with `apply-seccomp: write /proc/self/uid_map: Operation not permitted` | Bash sandbox setting — sandboxed Bash is enabled and `dangerouslyDisableSandbox` is disabled in this session's configuration |
+| 1 | Session basics | ❌ | Model = `claude-opus-5`; tools present (Bash, Read, Write, Edit, Glob, Grep, Agent, Skill, Workflow, GitHub MCP, Claude Code Remote MCP); `python3 --version`, `uv --version`, `df -h .` all failed with `apply-seccomp: write /proc/self/uid_map: Operation not permitted` | Bash sandbox wrapper fails to initialise — see Root cause. Not a misconfigured setting; `dangerouslyDisableSandbox` being disabled is what removes the usual fallback |
 | 2 | File tools | ❓ | Not run — aborted at check 1 | — |
-| 3 | Package install | ❓ | Not run — requires a shell | Bash sandbox setting |
-| 4 | Compute and write a chart | ❓ | Not run — requires a shell | Bash sandbox setting |
+| 3 | Package install | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 4 | Compute and write a chart | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
 | 5 | Output channel (chart to chat) | ❓ | Not run — depends on check 4 | — |
 | 6 | Inbound data (file upload) | ❓ | Not run — aborted at check 1 | — |
-| 7 | Network policy | ❓ | Not run — requires `curl` | Bash sandbox setting (then: cloud environment network policy) |
-| 8 | Local embeddings | ❓ | Not run — requires checks 3 and a shell | Bash sandbox setting |
-| 9 | Headless Claude, plain call | ❓ | Not run — requires a shell | Bash sandbox setting |
-| 10 | Headless Claude, restricted tools | ❓ | Not run — requires a shell | Bash sandbox setting |
-| 11 | Structured output | ❓ | Not run — requires a shell | Bash sandbox setting |
-| 12 | Agent SDK with in-process tool | ❓ | Not run — requires checks 3 and a shell | Bash sandbox setting |
-| 13 | Local commit — no push | ❓ | Not run — requires a shell | Bash sandbox setting |
+| 7 | Network policy | ❓ | Not run — requires `curl` | Bash sandbox wrapper fails to initialise — see Root cause (network policy still untested behind it) |
+| 8 | Local embeddings | ❓ | Not run — requires checks 3 and a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 9 | Headless Claude, plain call | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 10 | Headless Claude, restricted tools | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 11 | Structured output | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 12 | Agent SDK with in-process tool | ❓ | Not run — requires checks 3 and a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 13 | Local commit — no push | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
 
 ## Human confirmations
 - Chart visible in chat: not tested (no chart could be produced)
 - Uploaded file arrived on disk and could be opened: not tested
 
+## Root cause (measured via /proc, since the Read tool bypasses the Bash sandbox)
+The Bash tool builds a sandbox by creating a new user namespace and writing a UID mapping
+into it. That write is what fails. `/proc/self/uid_map` reads `0 0 4294967295` — the identity
+map of the **initial** user namespace. The kernel never permits writing the init namespace's
+`uid_map`; that returns `EPERM` unconditionally. So the wrapper is writing the mapping while
+still in the init namespace: its `unshare(CLONE_NEWUSER)` did not take effect.
+
+Everything that would normally block user namespaces is permissive here:
+
+| Probe | Value | Verdict |
+|---|---|---|
+| `/proc/sys/user/max_user_namespaces` | `64318` | allowed (not `0`) |
+| `kernel.apparmor_restrict_unprivileged_userns` | sysctl absent | no AppArmor restriction |
+| `kernel.unprivileged_userns_clone` | sysctl absent | no Debian-style gate |
+| `/proc/self/setgroups` | `allow` | not the setgroups trap |
+| Process UID | `0 0 0 0` | running as root |
+| `CapEff` | `000001fffeffffff` | includes CAP_SETUID (bit 7) |
+| `Seccomp` | `0` | no seccomp filter on the process |
+
+Kernel is `6.18.44-fc-v33` (Firecracker microVM). Caveat: /proc is readable but nothing is
+executable, so the wrapper's actual syscall sequence was not observed — the `unshare`
+conclusion is the reading most consistent with the evidence, not a watched event.
+
 ## Notes for the administrator
-- The blocker is the Bash sandbox, not the network, not the model allow-list, and not
-  permissions in the allow/deny sense. The sandbox wrapper itself fails to start, so no
-  command reaches a shell at all.
+- **This is not a setting that was configured wrongly.** The environment permits user
+  namespaces; the sandbox wrapper fails to enter one. It reads as a defect in the wrapper's
+  initialisation inside this container image, and is worth reporting to Anthropic. The
+  "setting most likely responsible" column in the table above should be read with that
+  correction in mind.
+- It is also not the network policy, not the model allow-list, and not a permissions
+  allow/deny entry. No command reaches a shell at all.
 - The session configuration also disables the `dangerouslyDisableSandbox` override, so there
-  is no in-session way to bypass it and continue the run.
+  is no in-session way to bypass it and continue the run. This is what turns a sandbox
+  setup failure into a total one: normally the fallback is to run unsandboxed with user
+  approval, and that escape hatch is closed here. Allowing that override, or disabling the
+  Bash sandbox for this environment, would unblock the run — at the cost of a real isolation
+  boundary, so it is an administrator's decision, not a default to reach for.
+- The same check run on a local Claude Code install works. That is consistent with the
+  above: macOS uses Seatbelt (`sandbox-exec`), an unrelated mechanism, and a local Linux
+  install is not already nested inside a container runtime.
 - Without a shell, a hands-on training in which participants install packages, run pandas and
   matplotlib, and build Python agents with the Agent SDK is not possible in this environment
   as currently configured. This is the one thing worth fixing before anything else is tested.
