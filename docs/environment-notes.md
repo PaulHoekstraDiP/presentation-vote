@@ -23,6 +23,11 @@ system Python 3.11, `/usr/local/bin/python3`.
   as a signed artifact (`~/.claude/policy-limits.json`). User-scope settings are
   not overwritten, so writing `~/.claude/settings.json` from the setup script is
   safe.
+- **The AppArmor userns workaround is a no-op here.** An earlier script wrote an
+  `/etc/apparmor.d/bwrap` profile when
+  `kernel.apparmor_restrict_unprivileged_userns` was `1`. That sysctl does not
+  exist on this kernel and `apparmor_parser` is not installed, so the block
+  never ran. Dropping it changes nothing.
 
 Dead ends, already tried: `sandbox.network.httpProxyPort` (no effect),
 uninstalling `@anthropic-ai/sandbox-runtime` (no-op), unsetting `HTTPS_PROXY`
@@ -61,26 +66,51 @@ narrow as a session runs.
 **Consequence:** do not let a live demo depend on a runtime install. Run the
 smoke test below at the start of a session, before an audience is watching.
 
-### `sandbox.filesystem.allowWrite: ["/root", "/opt", "/tmp"]`
-The sandbox write allowlist covers `/dev/*`, `/tmp/claude`, `.`, `$TMPDIR` and
-the repo directory — nothing else. So by default:
+### Never set `sandbox.filesystem` — it breaks session startup
 
-- `/root` and `/root/.cache` are read-only → `matplotlib` warns on every import
+**This was a real regression; do not reintroduce it.** Setting
+
+```json
+"sandbox": { "filesystem": { "allowWrite": ["/root", "/opt", "/tmp"] } }
+```
+
+stopped new sessions from starting at all. The setting exists and is settable at
+user scope (`sandbox.filesystem.allowRead`/`allowWrite` are among the few
+`sandbox.filesystem.*` keys enterprise policy does not restrict), which is what
+made it look safe. But the sandbox builds its own rules as:
+
+```js
+filesystem: { allowWrite: [e.privateTmp],
+              denyWrite: [...e.projectRoots, e.home, ...],
+              denyRead:  [e.home, ...e.tempRoots, ...] }
+```
+
+`$HOME` is on **both** `denyWrite` and `denyRead`, and `allowWrite` is the
+private tmp *only*. Putting `/root` (= `$HOME`) on `allowWrite` contradicts
+that directly, and `/tmp` collides with the private-tmp mapping. `setup.sh`
+now calls `sb.pop("filesystem", None)` so it also repairs a container whose
+settings already carry the bad key.
+
+### Cache env vars, and what is actually read-only
+
+The sandbox write allowlist covers `/dev/*`, `/tmp/claude`, `.`, `$TMPDIR` and
+the repo directory — nothing else. So:
+
+- `/root` and `/root/.cache` are read-only → `matplotlib` warns on every import,
   and `chromadb` dies with
   `OSError: [Errno 30] Read-only file system: '/root/.cache/chroma'`.
-- `/opt/cache` is read-only *despite being mode 0777 on disk*. **`chmod` does
-  not fix this** — an earlier `chmod -R 0777 /opt/cache` was a no-op against the
-  real cause.
-- `/tmp` is read-only; only `/tmp/claude*` is writable.
+- `/opt/cache` is read-only *despite being mode 0777 on disk*. The `chmod -R
+  0777 /opt/cache` in `setup.sh` is **not** what makes it writable — it is kept
+  only so the build-time `mkdir` is group/other-readable.
+- `/tmp` is read-only; only `/tmp/claude*` is writable. Use `$TMPDIR`.
 
-Adding these three paths is what makes tool caches behave as they would locally,
-and it replaces the previous approach of redirecting `MPLCONFIGDIR`, `HF_HOME`,
-`XDG_CACHE_HOME` and `UV_CACHE_DIR` at `/opt/cache`. Those env vars are no
-longer needed.
-
-Note `sandbox.filesystem.allowRead`/`allowWrite` are among the few
-`sandbox.filesystem.*` keys not restricted by enterprise policy, so they are
-settable at user scope.
+Since `sandbox.filesystem` is off limits, the workable approach is the original
+one: point the tools at `/opt/cache` via `MPLCONFIGDIR`, `HF_HOME`,
+`XDG_CACHE_HOME` and `UV_CACHE_DIR`. Known limitation: matplotlib still prints
+its "not a writable directory" warning on import, because `/opt/cache` is not on
+the sandbox allowlist and cannot be added. It is cosmetic — the font cache is
+pre-built and readable, so import stays at ~0.8s cold and warm, with no rebuild.
+Leaving it noisy is the accepted trade for sessions that start.
 
 ### `PIP_IGNORE_INSTALLED=1` and `PIP_BREAK_SYSTEM_PACKAGES=1`
 This is the fix for the long-standing `chromadb` install failure, which was
@@ -203,7 +233,10 @@ sklearn.decomposition.PCA(n_components=1).fit(np.random.rand(8, 3))
 - The default embedding function downloads ONNX MiniLM-L6-v2 on first use to
   `Path.home()/".cache"/"chroma"/"onnx_models"/"all-MiniLM-L6-v2"`. It is
   derived from `Path.home()`, so pointing `HF_HOME` or `XDG_CACHE_HOME`
-  elsewhere has no effect on it.
+  elsewhere has no effect on it. `$HOME` is read-only under the sandbox and
+  cannot be opened up (see the `sandbox.filesystem` warning above), so run
+  embedding work with `HOME` set to a writable path, e.g.
+  `HOME=$TMPDIR python3 your_script.py`.
 - `_download_model_if_not_exists()` checks for six files (`config.json`,
   `model.onnx`, `special_tokens_map.json`, `tokenizer_config.json`,
   `tokenizer.json`, `vocab.txt`) under `.../onnx/` *before* calling `makedirs`
