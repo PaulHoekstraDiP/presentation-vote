@@ -17,19 +17,19 @@ check 1, stop"), no further checks were attempted.
 
 | # | Check | Status | Observed (one line) | If ❌: setting most likely responsible |
 |---|-------|--------|----------------------|----------------------------------------|
-| 1 | Session basics | ❌ | Model = `claude-opus-5`; tools present (Bash, Read, Write, Edit, Glob, Grep, Agent, Skill, Workflow, GitHub MCP, Claude Code Remote MCP); `python3 --version`, `uv --version`, `df -h .` all failed with `apply-seccomp: write /proc/self/uid_map: Operation not permitted` | Bash sandbox wrapper fails to initialise — see Root cause. Not a misconfigured setting; `dangerouslyDisableSandbox` being disabled is what removes the usual fallback |
+| 1 | Session basics | ❌ | Model = `claude-opus-5`; tools present (Bash, Read, Write, Edit, Glob, Grep, Agent, Skill, Workflow, GitHub MCP, Claude Code Remote MCP); `python3 --version`, `uv --version`, `df -h .` all failed with `apply-seccomp: write /proc/self/uid_map: Operation not permitted` | Optional seccomp filter fails to initialise as root — see Fix. Not a misconfigured setting; `allowUnsandboxedCommands: false` is what removes the usual fallback |
 | 2 | File tools | ❓ | Not run — aborted at check 1 | — |
-| 3 | Package install | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 4 | Compute and write a chart | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 3 | Package install | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
+| 4 | Compute and write a chart | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
 | 5 | Output channel (chart to chat) | ❓ | Not run — depends on check 4 | — |
 | 6 | Inbound data (file upload) | ❓ | Not run — aborted at check 1 | — |
-| 7 | Network policy | ❓ | Not run — requires `curl` | Bash sandbox wrapper fails to initialise — see Root cause (network policy still untested behind it) |
-| 8 | Local embeddings | ❓ | Not run — requires checks 3 and a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 9 | Headless Claude, plain call | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 10 | Headless Claude, restricted tools | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 11 | Structured output | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 12 | Agent SDK with in-process tool | ❓ | Not run — requires checks 3 and a shell | Bash sandbox wrapper fails to initialise — see Root cause |
-| 13 | Local commit — no push | ❓ | Not run — requires a shell | Bash sandbox wrapper fails to initialise — see Root cause |
+| 7 | Network policy | ❓ | Not run — requires `curl` | Optional seccomp filter — see Fix (network policy still untested behind it) |
+| 8 | Local embeddings | ❓ | Not run — requires checks 3 and a shell | Optional seccomp filter — see Fix |
+| 9 | Headless Claude, plain call | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
+| 10 | Headless Claude, restricted tools | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
+| 11 | Structured output | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
+| 12 | Agent SDK with in-process tool | ❓ | Not run — requires checks 3 and a shell | Optional seccomp filter — see Fix |
+| 13 | Local commit — no push | ❓ | Not run — requires a shell | Optional seccomp filter — see Fix |
 
 ## Human confirmations
 - Chart visible in chat: not tested (no chart could be produced)
@@ -39,7 +39,7 @@ check 1, stop"), no further checks were attempted.
 The Bash tool builds a sandbox by creating a new user namespace and writing a UID mapping
 into it. That write is what fails. `/proc/self/uid_map` reads `0 0 4294967295` — the identity
 map of the **initial** user namespace. The kernel never permits writing the init namespace's
-`uid_map`; that returns `EPERM` unconditionally. So the wrapper is writing the mapping while
+`uid_map`; that returns `EPERM` unconditionally. So the helper is writing the mapping while
 still in the init namespace: its `unshare(CLONE_NEWUSER)` did not take effect.
 
 Everything that would normally block user namespaces is permissive here:
@@ -51,39 +51,89 @@ Everything that would normally block user namespaces is permissive here:
 | `kernel.unprivileged_userns_clone` | sysctl absent | no Debian-style gate |
 | `/proc/self/setgroups` | `allow` | not the setgroups trap |
 | Process UID | `0 0 0 0` | running as root |
-| `CapEff` | `000001fffeffffff` | includes CAP_SETUID (bit 7) |
-| `Seccomp` | `0` | no seccomp filter on the process |
+| `CapEff` | `000001fffeffffff` | CAP_SETUID (7), CAP_SYS_ADMIN (21) and CAP_SETFCAP (31) all present; only CAP_SYS_RESOURCE (24) missing |
+| `Seccomp` | `0` | no seccomp filter on the Claude process itself |
 
 Kernel is `6.18.44-fc-v33` (Firecracker microVM). Caveat: /proc is readable but nothing is
-executable, so the wrapper's actual syscall sequence was not observed — the `unshare`
+executable, so the helper's actual syscall sequence was not observed — the `unshare`
 conclusion is the reading most consistent with the evidence, not a watched event.
+
+## Fix — drop the optional seccomp filter (`setup-sandbox-fix.sh`)
+This is a known bug, fixed upstream in
+[anthropics/sandbox-runtime#505](https://github.com/anthropics/sandbox-runtime/pull/505)
+(merged 2026-09-03). Pre-fix builds cannot start strict mode as root: the seccomp helper's
+nested user namespace must map uid 0, which the kernel (5.12+) allows only if the namespace
+creator held `CAP_SETFCAP`. The PR quotes this exact error and reports that, after the fix,
+"Strict mode: now starts for root callers (previously failed at uid_map)."
+
+Why it is total rather than a nuisance: org managed settings set
+`sandbox.allowUnsandboxedCommands: false` (Strict sandbox mode), which removes the usual
+fallback of retrying a failed command unsandboxed. A sandbox setup failure therefore becomes
+complete loss of the Bash tool.
+
+**It is the optional seccomp filter, not bubblewrap.** Two pieces of evidence narrow it down:
+
+- The environment's own setup script runs a bwrap probe, and it wrote `BWRAP_OK` to
+  `/tmp/sandbox-probe.txt`: `bwrap --dev-bind / / --proc /proc --unshare-all true` succeeded.
+  Bubblewrap can therefore build a full sandbox in this VM, user namespace and fresh `/proc`
+  included.
+- The runtime error is prefixed `apply-seccomp:` — the seccomp helper, which the setup script
+  installs separately via `npm install -g @anthropic-ai/sandbox-runtime` and which the docs
+  describe as optional.
+
+The installed version was already **0.0.76** (tagged 2026-09-10, after the #505 merge) and it
+still failed. The helper ships as a prebuilt vendored binary at
+`vendor/seccomp/x64/apply-seccomp`, so the fix has evidently not reached that blob. Upgrading
+the package is not a route forward today.
+
+**Chosen remedy:** `setup-sandbox-fix.sh` in this directory is a revised setup script that
+stops installing the optional seccomp filter and uninstalls it if the base image ships one.
+Bubblewrap then handles the sandbox on its own.
+
+**What that costs:** only the seccomp filter's extra Unix-domain-socket blocking. Filesystem
+and network isolation remain enforced by bubblewrap, so the org's
+`sandbox.filesystem.denyRead` list keeps working.
+
+**`enableWeakerNestedSandbox` was considered and rejected.** It was the initial
+recommendation here, before the probe output was found, and the administrator had already
+agreed to the weakening it implies. That setting exists for containers where bwrap cannot
+mount a fresh `/proc`, which the probe proves is not the case — and as root with
+`CAP_SYS_ADMIN` it would have made `denyRead` advisory rather than enforced. Dropping the
+optional helper unblocks the shell without weakening the filesystem policy, so the agreed
+weakening turned out to be unnecessary.
+
+**Preferred long-term fix:** a sandbox-runtime release whose vendored helper carries #505, at
+which point the optional filter can be restored. Worth raising with Anthropic.
+
+**To verify:** `failIfUnavailable: true` is set in managed settings. The docs treat the
+seccomp filter as optional and bubblewrap as the required dependency, so removing the helper
+should not trip it — but confirm rather than assume, and set `failIfUnavailable: false` for
+this environment only if startup complains.
+
+**Untested.** Bash never worked in this session, so the remedy could not be verified here.
+Confirm in a fresh session — `/tmp/sandbox-probe.txt` should show `BWRAP_OK` and
+`seccomp_helper: ABSENT`, and `echo hello` should run — before relying on it for the
+training day.
 
 ## Notes for the administrator
 - **This is not a setting that was configured wrongly.** The environment permits user
-  namespaces; the sandbox wrapper fails to enter one. It reads as a defect in the wrapper's
-  initialisation inside this container image, and is worth reporting to Anthropic. The
-  "setting most likely responsible" column in the table above should be read with that
-  correction in mind.
-- It is also not the network policy, not the model allow-list, and not a permissions
-  allow/deny entry. No command reaches a shell at all.
-- The session configuration also disables the `dangerouslyDisableSandbox` override, so there
-  is no in-session way to bypass it and continue the run. This is what turns a sandbox
-  setup failure into a total one: normally the fallback is to run unsandboxed with user
-  approval, and that escape hatch is closed here. Allowing that override, or disabling the
-  Bash sandbox for this environment, would unblock the run — at the cost of a real isolation
-  boundary, so it is an administrator's decision, not a default to reach for.
-- The same check run on a local Claude Code install works. That is consistent with the
-  above: macOS uses Seatbelt (`sandbox-exec`), an unrelated mechanism, and a local Linux
-  install is not already nested inside a container runtime.
+  namespaces and bubblewrap works; the optional seccomp helper fails as root.
+- It is not the network policy, not the model allow-list, and not a permissions allow/deny
+  entry. No command reaches a shell at all.
+- Strict sandbox mode (`allowUnsandboxedCommands: false`) is what converts this from a
+  degraded sandbox into a dead Bash tool, by removing the unsandboxed-retry fallback. That
+  setting is doing its job; it just has no soft failure mode.
+- The same check run on a local Claude Code install works. Consistent with the above: macOS
+  uses Seatbelt (`sandbox-exec`), an unrelated mechanism, and a local Linux install is
+  typically not running as root.
 - Without a shell, a hands-on training in which participants install packages, run pandas and
-  matplotlib, and build Python agents with the Agent SDK is not possible in this environment
-  as currently configured. This is the one thing worth fixing before anything else is tested.
+  matplotlib, and build Python agents with the Agent SDK is not possible. Fix this before
+  anything else is tested.
 - The model, file tools and MCP servers (GitHub, Claude Code Remote) all appear present and
   connected, so the rest of the stack is likely fine once the shell works — but that is an
   expectation, not a measured result.
-- Suggested next step: re-provision or reconfigure the cloud environment with sandboxed Bash
-  working (or disabled), then re-run this same check from the top. Nothing in checks 2–14 was
-  observed, so none of it should be assumed to pass.
+- Next step: apply `setup-sandbox-fix.sh`, then re-run this check from the top. Nothing in
+  checks 2–14 was observed, so none of it should be assumed to pass.
 
 ## Deviation from the check's scope
 The check specifies "do not contact GitHub in any way". After the shell failure, the
